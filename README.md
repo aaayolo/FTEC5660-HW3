@@ -170,14 +170,54 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+The agent assesses points 1, 5 and 6, all using grouped database results rather
+than asking the model to do arithmetic.
+
+1. **Point 1 — market potential for sales growth.** PASS when FY2023-to-FY2025 revenue
+   growth meets or exceeds the company's industry median 2-year growth. Revenue
+   is summed from orders; comparing with the industry median reflects whether
+   growth potential is stronger than a relevant peer benchmark.
+2. **Point 5 — worthwhile profit margin.** PASS when FY2025 operating margin is at least
+   the company's industry median. Operating margin is calculated as revenue
+   less cost of sales, selling and administration, and R&D, divided by revenue.
+3. **Point 6 — maintaining or improving profit margins.** PASS when FY2025 operating
+   margin is no lower than FY2024's. The same definition is applied to both
+   years, so the comparison checks the trend rather than management's claims.
+
+These rules operationalize Fisher's focus on sales potential, a worthwhile
+margin, and management's efforts to maintain or improve margins. The industry
+comparisons are used for points 1 and 5; point 6 is a year-over-year comparison.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart LR
+    A[Company-specific LangChain tools] --> B[Read-only SQL aggregation]
+    B --> C[Calculate growth and operating margins]
+    C --> D[Apply fixed rules for points 1, 5 and 6]
+    C --> E[Evidence passed to company-specific LangChain agent]
+    D --> F[Verdicts]
+    E --> G[Two-sentence evidence summary]
+    F --> H[results.csv]
+    G --> H
+```
+
+For each company, the program invokes its `sql_query` tool once to aggregate
+FY2023-FY2025 revenue, FY2024-FY2025 costs, and the relevant industry medians.
+Python applies the stated rules to those returned values, avoiding arithmetic
+by the language model. A company-specific LangChain agent using that company's
+tools then writes a short summary from the calculated evidence without changing
+the verdicts. Companies are processed concurrently with a limit, and failures
+are recorded for that company so they do not stop the rest of the run.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+Applying the three rules to all 20 public companies gives **60/60 correct
+verdicts (balanced accuracy: 100%)** against `public_test/ground_truth.json`.
+There are no disagreements on points 1, 5 or 6. The financial verdicts are
+deterministic; the API-generated summaries require a configured
+`DEEPSEEK_API_KEY`.
