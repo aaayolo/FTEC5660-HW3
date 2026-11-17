@@ -7,6 +7,8 @@ import argparse
 import asyncio
 import csv
 import json
+import math
+import os
 import sqlite3
 import threading
 import zlib
@@ -57,22 +59,83 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 6]
+
+FINANCIAL_QUERY = """
+WITH annual_revenue AS (
+    SELECT substr(order_date, 1, 4) AS year, SUM(amount) AS revenue
+    FROM orders
+    WHERE order_date >= '2023-01-01' AND order_date < '2026-01-01'
+    GROUP BY substr(order_date, 1, 4)
+),
+annual_costs AS (
+    SELECT substr(month, 1, 4) AS year,
+           SUM(cost_of_sales + selling_admin + research_development) AS costs
+    FROM monthly_costs
+    WHERE month >= '2024-01' AND month < '2026-01'
+    GROUP BY substr(month, 1, 4)
+)
+SELECT
+    ROUND(100.0 * (r25.revenue / r23.revenue - 1), 2) AS growth_2023_2025_pct,
+    ROUND(im.revenue_growth_2y_pct, 2) AS industry_growth_2y_pct,
+    ROUND(100.0 * (r25.revenue - c25.costs) / r25.revenue, 2) AS margin_2025_pct,
+    ROUND(im.operating_margin_pct, 2) AS industry_margin_pct,
+    ROUND(100.0 * (r24.revenue - c24.costs) / r24.revenue, 2) AS margin_2024_pct
+FROM company AS co
+JOIN industry_medians AS im ON im.industry = co.industry
+CROSS JOIN annual_revenue AS r23
+CROSS JOIN annual_revenue AS r24
+CROSS JOIN annual_revenue AS r25
+CROSS JOIN annual_costs AS c24
+CROSS JOIN annual_costs AS c25
+WHERE r23.year = '2023' AND r24.year = '2024' AND r25.year = '2025'
+  AND c24.year = '2024' AND c25.year = '2025'
+"""
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Create the required DeepSeek model once."""
+    from langchain_deepseek import ChatDeepSeek
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is missing; set it in .env or the environment.")
+    return ChatDeepSeek(model=MODEL_NAME, api_key=api_key, temperature=0)
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
-    ### YOUR CODE HERE
-    return None
+
+def parse_financial_metrics(result: Any) -> dict[str, float]:
+    """Parse the single-row result returned by the sql_query tool."""
+    text = str(getattr(result, "content", result)).strip()
+    if text.startswith("SQL error:"):
+        raise RuntimeError(text)
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise RuntimeError(f"Expected one SQL result row, received: {text}")
+
+    columns = [column.strip() for column in lines[0].split("|")]
+    values = [value.strip() for value in lines[1].split("|")]
+    if len(columns) != len(values):
+        raise RuntimeError(f"Malformed SQL result row: {lines[1]}")
+    try:
+        metrics = {column: float(value) for column, value in zip(columns, values)}
+    except ValueError as exc:
+        raise RuntimeError(f"Non-numeric SQL result: {lines[1]}") from exc
+    if not all(math.isfinite(value) for value in metrics.values()):
+        raise RuntimeError(f"Non-finite SQL result: {lines[1]}")
+    return metrics
+
+
+def _message_text(message: Any) -> str:
+    """Extract plain text from a LangChain message."""
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            block["text"] for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ).strip()
+    return str(content).strip()
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +171,74 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    from langchain.agents import create_agent
+
+    async def analyze_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        points: dict[int, str | None] = {point: None for point in CHOSEN_POINTS}
+        try:
+            if len(tools) < 4 or getattr(tools[2], "name", None) != "sql_query":
+                raise RuntimeError("Expected the company's sql_query tool in position 3.")
+            sql_result = await tools[2].ainvoke({"query": FINANCIAL_QUERY})
+            metrics = parse_financial_metrics(sql_result)
+
+            revenue_growth = metrics["growth_2023_2025_pct"]
+            industry_growth = metrics["industry_growth_2y_pct"]
+            margin_2025 = metrics["margin_2025_pct"]
+            industry_margin = metrics["industry_margin_pct"]
+            margin_2024 = metrics["margin_2024_pct"]
+            points = {
+                1: "PASS" if revenue_growth >= industry_growth else "FAIL",
+                5: "PASS" if margin_2025 >= industry_margin else "FAIL",
+                6: "PASS" if margin_2025 >= margin_2024 else "FAIL",
+            }
+            evidence = (
+                f"Two-year revenue growth: {revenue_growth:.2f}% "
+                f"(industry median {industry_growth:.2f}%); "
+                f"FY2025 operating margin: {margin_2025:.2f}% "
+                f"(industry median {industry_margin:.2f}%); "
+                f"FY2024 operating margin: {margin_2024:.2f}%. "
+                f"Rule-based verdicts: point 1 {points[1]}, point 5 {points[5]}, "
+                f"point 6 {points[6]}."
+            )
+            company_agent = create_agent(
+                model=agent,
+                tools=tools,
+                system_prompt=(
+                    "You are a careful financial research assistant. The evidence below "
+                    "was calculated from this company's read-only SQL tool. Do not make "
+                    "new calculations, call tools, or change the stated verdicts. "
+                    "Write a concise "
+                    "two-sentence summary explaining the verdicts using only this evidence."
+                ),
+            )
+            response = await company_agent.ainvoke(
+                {"messages": [{"role": "user", "content": evidence}]}
+            )
+            messages = response.get("messages", [])
+            summary = _message_text(messages[-1]) if messages else ""
+            if not summary:
+                raise RuntimeError("The model returned an empty summary.")
+            return name, {"points": points, "summary": summary}
+        except Exception as exc:
+            if all(value is None for value in points.values()):
+                summary = f"Analysis failed ({type(exc).__name__}): {exc}"
+            else:
+                summary = (
+                    f"Verdicts were computed from SQL evidence, but summary generation "
+                    f"failed ({type(exc).__name__}): {exc}"
+                )
+            return name, {"points": points, "summary": summary}
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def limited_analyze(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            return await analyze_one(name, tools)
+
+    results = await asyncio.gather(
+        *(limited_analyze(name, tools) for name, tools in companies.items())
+    )
+    return dict(results)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
